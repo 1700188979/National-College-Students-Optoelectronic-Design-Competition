@@ -1,0 +1,253 @@
+import cv2
+import numpy as np
+import onnxruntime as ort
+import time
+import threading
+from picamera2 import Picamera2
+import libcamera
+import traceback
+import os
+from gpiozero import TonalBuzzer, Button, LED
+from gpiozero.tones import Tone
+from IPython.display import display
+import ipywidgets.widgets as widgets
+import sys
+sys.path.append("/home/pi/makerobo_code/yolov5-master")
+from LOBOROBOT import LOBOROBOT
+
+robot = LOBOROBOT()
+
+# 向前运动 4 秒
+robot.t_up(speed=80, t_time=4)
+
+# 停止 0.5 秒
+robot.t_stop(0.2)
+
+# 左转 1 秒
+robot.turnRight(speed=30, t_time=1)
+
+# 再停止
+robot.t_stop(0.5)
+
+# 释放所有GPIO资源
+os.system('sudo killall pigpiod')
+os.system('sudo pigpiod')
+time.sleep(1)
+
+Gpin = LED(12)  # GPIO12 绿灯
+Rpin = LED(6)   # 可选红灯
+Gpin.off()     # 初始化时关闭绿灯
+
+from gpiozero import TonalBuzzer
+from gpiozero.tones import Tone
+from LOBOROBOT import LOBOROBOT
+
+buzzer = TonalBuzzer(17)
+robot = LOBOROBOT()
+channel = 12  # 控制 LED 的 PWM 通道
+
+def play_victory_music():
+    try:
+        # 点亮 LED
+        robot.pwm.setLevel(channel, 1)
+        print("🔆 LED 亮起，播放音乐")
+
+        Tone_CM = [262, 294, 330, 349, 392, 440, 494, 523]
+        song = [
+            Tone_CM[3], Tone_CM[4], Tone_CM[5],
+            Tone_CM[3], Tone_CM[2], Tone_CM[3],
+            Tone_CM[4], Tone_CM[5], Tone_CM[6],
+            Tone_CM[5], Tone_CM[4]
+        ]
+        beat = [1, 1, 2, 1, 1, 2, 1, 1, 1, 1, 3]
+
+        for i in range(len(song)):
+            buzzer.play(Tone(song[i]))
+            print(f"🎶 播放音符: {song[i]} Hz")
+            time.sleep(beat[i] * 0.25)
+
+        buzzer.stop()
+        robot.pwm.setLevel(channel, 0)
+        print("✅ 胜利音乐播放完毕，LED 熄灭")
+
+    except Exception as e:
+        print(f"❌ 胜利音乐播放失败: {e}")
+
+model_path = "/home/pi/makerobo_code/yolov5-master/best3.onnx"
+net = ort.InferenceSession(model_path)
+model_h, model_w = 320, 320
+nl, na = 3, 3
+stride = [8., 16., 32.]
+anchors = [[10,13,16,30,33,23], [30,61,62,45,59,119], [116,90,156,198,373,326]]
+anchor_grid = np.asarray(anchors, dtype=np.float32).reshape(nl, -1, 2)
+labels = {0: 'goal'}
+
+pan, tilt = 135, 0
+pan_min, pan_max = -90, 180
+tilt_min, tilt_max = 0, 90
+
+try:
+    clbrobot = LOBOROBOT()
+    if pan_min <= pan <= pan_max:
+        clbrobot.set_servo_angle(10, pan)
+    clbrobot.set_servo_angle(9, tilt)
+    print("LOBOROBOT初始化成功")
+except Exception as e:
+    print(f"LOBOROBOT初始化失败: {str(e)}")
+    class DummyLOBOROBOT:
+        def set_servo_angle(self, channel, angle): print(f"虚拟伺服: 通道 {channel} 角度 {angle}")
+        def turnRight(self, speed, delay): print(f"虚拟右转: 速度 {speed}")
+        def turnLeft(self, speed, delay): print(f"虚拟左转: 速度 {speed}")
+        def t_up(self, speed, delay): print(f"虚拟前进: 速度 {speed}")
+        def t_stop(self, delay): print("虚拟停止")
+    clbrobot = DummyLOBOROBOT()
+
+try:
+    picamera = Picamera2()
+    config = picamera.create_preview_configuration(main={"format": 'RGB888', "size": (320, 240)})
+    config["transform"] = libcamera.Transform(hflip=0, vflip=0)
+    picamera.configure(config)
+    picamera.start()
+    print("相机启动成功")
+except Exception as e:
+    print(f"相机启动失败: {str(e)}")
+    traceback.print_exc()
+    class DummyCamera:
+        started = False
+        def capture_array(self): return np.zeros((240, 320, 3), dtype=np.uint8)
+    picamera = DummyCamera()
+
+image_widget = widgets.Image(format='jpeg', width=640, height=480)
+display(image_widget)
+
+def bgr8_to_jpeg(value, quality=75):
+    return bytes(cv2.imencode('.jpg', value)[1])
+
+last_target = None
+missing_frames = 0
+max_missing_frames = 10
+car_state = "stop"
+Kp, Ki, Kd = 0.5, 0.01, 0.1
+prev_error = 0
+integral = 0
+
+def post_process_opencv(outputs, model_h, model_w, img_h, img_w, thred_nms=0.4, thred_conf=0.5):
+    conf = outputs[:, 4]
+    cx, cy = outputs[:, 0] * img_w / model_w, outputs[:, 1] * img_h / model_h
+    w, h = outputs[:, 2] * img_w / model_w, outputs[:, 3] * img_h / model_h
+    x1, y1 = cx - w/2, cy - h/2
+    x2, y2 = cx + w/2, cy + h/2
+    boxes = np.stack([x1, y1, x2, y2], axis=1)
+    scores = conf
+    class_ids = np.argmax(outputs[:, 5:], axis=1)
+    indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), thred_conf, thred_nms)
+    if len(indices) > 0:
+        indices = indices.flatten()
+        return boxes[indices], scores[indices], class_ids[indices]
+    return np.array([]), np.array([]), np.array([])
+
+
+# 命中状态变量
+hit_start_time = None
+victory_triggered = False
+
+def infer_and_track(frame):
+    global pan, tilt, last_target, missing_frames, car_state
+    global Kp, Ki, Kd, prev_error, integral, hit_start_time, victory_triggered
+    # 命中区域参数和计算
+    offset_x = -35
+    offset_y = 29
+    box_width = 100
+    box_height = 80
+    aim_x = frame.shape[1] / 2 + offset_x
+    aim_y = frame.shape[0] / 2 + offset_y
+    box_left = aim_x - box_width / 2
+    box_right = aim_x + box_width / 2
+    box_top = aim_y - box_height / 2
+    box_bottom = aim_y + box_height / 2
+
+    offset_x = -30
+    offset_y = 15
+    aim_x = frame.shape[1] / 2 + offset_x
+    aim_y = frame.shape[0] / 2 + offset_y
+
+    if frame.shape[0] == 0 or frame.shape[1] == 0:
+        return np.zeros((240, 320, 3), dtype=np.uint8)
+
+    img = cv2.resize(frame, (model_w, model_h))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    blob = np.expand_dims(np.transpose(img, (2, 0, 1)), axis=0)
+    outputs = net.run(None, {net.get_inputs()[0].name: blob})[0].squeeze(0)
+
+    boxes, scores, ids = post_process_opencv(outputs, model_h, model_w, frame.shape[0], frame.shape[1])
+
+    if len(boxes):
+        missing_frames = 0
+        for box, score, cls_id in zip(boxes, scores, ids):
+            center_x = (box[0] + box[2]) / 2
+            center_y = (box[1] + box[3]) / 2
+            last_target = (center_x, center_y)
+            break
+    else:
+        missing_frames += 1
+
+    if last_target and missing_frames <= max_missing_frames:
+        err_x = last_target[0] - aim_x
+        err_y = last_target[1] - aim_y
+
+        error = err_x
+        integral += error
+        derivative = error - prev_error
+        pid_output = Kp * error + Ki * integral + Kd * derivative
+        prev_error = error
+
+        pan += pid_output / 50
+        pan = max(pan_min, min(pan_max, pan))
+
+        if box_left <= last_target[0] <= box_right and box_top <= last_target[1] <= box_bottom:
+            if hit_start_time is None:
+                hit_start_time = time.time()
+            elif not victory_triggered and time.time() - hit_start_time >= 2:
+                print("🎯 命中目标区域，触发胜利信号！")
+                threading.Thread(target=play_victory_music).start()
+                victory_triggered = True
+                cv2.putText(frame, "GEI IT!", (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
+        if abs(err_x) < 15 and abs(err_y) < 15:
+            hit_start_time = None
+
+        if abs(err_y) > 15:
+            tilt += err_y / 75
+            tilt = max(tilt_min, min(tilt_max, tilt))
+
+        if pan_min <= pan <= pan_max:
+            clbrobot.set_servo_angle(10, pan)
+            clbrobot.set_servo_angle(9, tilt)
+
+    cv2.putText(frame, f"Pan: {pan:.1f} | Tilt: {tilt:.1f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+    cv2.putText(frame, f"Target: {'Found' if last_target else 'Lost'}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+    if last_target:
+        cv2.circle(frame, (int(last_target[0]), int(last_target[1])), 3, (0, 0, 255), -1)
+
+    cv2.line(frame, (frame.shape[1]//2 + offset_x, 0), (frame.shape[1]//2 + offset_x, frame.shape[0]), (0, 255, 0), 1)
+    cv2.line(frame, (0, frame.shape[0]//2 + offset_y), (frame.shape[1], frame.shape[0]//2 + offset_y), (0, 255, 0), 1)
+
+    return frame
+
+def video_loop():
+    while True:
+        try:
+            frame = picamera.capture_array()
+            frame = cv2.flip(frame, 0)
+            result = infer_and_track(frame)
+            image_widget.value = bgr8_to_jpeg(result)
+        except Exception as e:
+            print(f"视频循环错误: {str(e)}")
+            frame = np.zeros((240, 320, 3), dtype=np.uint8)
+            cv2.putText(frame, f"Error: {str(e)}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            image_widget.value = bgr8_to_jpeg(frame)
+            time.sleep(1)
+
+thread = threading.Thread(target=video_loop)
+thread.daemon = True
+thread.start()
